@@ -15,257 +15,408 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
 using NoSoliciting.Interface;
 
-namespace NoSoliciting.Trainer {
-    internal static class Program {
-        private static readonly string[] StopWords = {
-            "discord",
-            "gg",
-            "twitch",
-            "tv",
-            "lgbt",
-            "lgbtq",
-            "lgbtqia",
-            "http",
-            "https",
-            "18",
-            "come",
-            "join",
-            "blu",
-            "mounts",
-            "ffxiv",
+namespace NoSoliciting.Trainer;
+
+internal static class Program {
+    private static readonly string[] StopWords =
+    [
+        "discord",
+        "gg",
+        "twitch",
+        "tv",
+        "lgbt",
+        "lgbtq",
+        "lgbtqia",
+        "http",
+        "https",
+        "18",
+        "come",
+        "join",
+        "blu",
+        "mounts",
+        "ffxiv"
+    ];
+
+    private enum Mode {
+        Test,
+        CreateModel,
+        Interactive,
+        InteractiveFull,
+        Normalise,
+    }
+
+    [Serializable]
+    [JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
+    private class ReportInput {
+        public uint ReportVersion { get; } = 2;
+        public uint ModelVersion { get; set; }
+        public DateTime Timestamp { get; set; }
+        public ushort Type { get; set; }
+        public List<byte> Sender { get; set; }
+        public List<byte> Content { get; set; }
+        public string? Reason { get; set; }
+        public string? SuggestedClassification { get; set; }
+    }
+
+    private static void Main(string[] args) {
+        var mode = args[0] switch {
+            "test" => Mode.Test,
+            "create-model" => Mode.CreateModel,
+            "interactive" => Mode.Interactive,
+            "interactive-full" => Mode.InteractiveFull,
+            "normalise" => Mode.Normalise,
+            _ => throw new ArgumentException("invalid argument"),
         };
 
-        private enum Mode {
-            Test,
-            CreateModel,
-            Interactive,
-            InteractiveFull,
-            Normalise,
+        if (mode == Mode.Normalise) {
+            Console.WriteLine("Ready");
+            while (true) {
+                Console.Write("> ");
+                var input = Console.ReadLine();
+                var bytes = Convert.FromBase64String(input!);
+                var toNormalise = Encoding.UTF8.GetString(bytes);
+                var normalised = NoSolUtil.Normalise(toNormalise);
+                Console.WriteLine(normalised);
+            }
         }
 
-        [Serializable]
-        [JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
-        private class ReportInput {
-            public uint ReportVersion { get; } = 2;
-            public uint ModelVersion { get; set; }
-            public DateTime Timestamp { get; set; }
-            public ushort Type { get; set; }
-            public List<byte> Sender { get; set; }
-            public List<byte> Content { get; set; }
-            public string? Reason { get; set; }
-            public string? SuggestedClassification { get; set; }
+        var path = "../../../data.csv";
+        if (args.Length > 1) {
+            path = args[1];
         }
 
-        private static void Main(string[] args) {
-            var mode = args[0] switch {
-                "test" => Mode.Test,
-                "create-model" => Mode.CreateModel,
-                "interactive" => Mode.Interactive,
-                "interactive-full" => Mode.InteractiveFull,
-                "normalise" => Mode.Normalise,
-                _ => throw new ArgumentException("invalid argument"),
-            };
+        var parentDir = Directory.GetParent(path);
+        if (parentDir == null) {
+            throw new ArgumentException("data.csv did not have a parent directory");
+        }
 
-            if (mode == Mode.Normalise) {
-                Console.WriteLine("Ready");
+        var ctx = new MLContext(seed: 1);
 
-                while (true) {
-                    Console.Write("> ");
-                    var input = Console.ReadLine();
-                    var bytes = Convert.FromBase64String(input!);
-                    var toNormalise = Encoding.UTF8.GetString(bytes);
-                    var normalised = NoSolUtil.Normalise(toNormalise);
-                    Console.WriteLine(normalised);
-                }
+        // =========================
+        // Load CSV into Data
+        // =========================
+        List<Data> records;
+        using (var fileStream = new FileStream(path, FileMode.Open)) {
+            using var stream = new StreamReader(fileStream);
+            using var csv = new CsvReader(stream, new CsvConfiguration(CultureInfo.InvariantCulture) {
+                HeaderValidated = null,
+            });
+
+            records = csv
+                .GetRecords<Data>()
+                .Select(rec => {
+                    // Clean up some weird characters
+                    rec.Message = rec.Message
+                        .Replace("", "")
+                        .Replace("", "")
+                        .Replace("\r\n", " ")
+                        .Replace("\r", " ")
+                        .Replace("\n", " ");
+                    return rec;
+                })
+                .OrderBy(rec => rec.Category)
+                .ThenBy(rec => rec.Channel)
+                .ThenBy(rec => rec.Message)
+                .ToList();
+        }
+
+        // Re-save (original code)
+        using (var fileStream = new FileStream(path, FileMode.Create)) {
+            using var stream = new StreamWriter(fileStream);
+            using var csv = new CsvWriter(stream, new CsvConfiguration(CultureInfo.InvariantCulture) {
+                NewLine = "\n",
+            });
+            csv.WriteRecords(records);
+        }
+
+        // =========================
+        // Class Weights
+        // =========================
+        var classes = new Dictionary<string, uint>();
+        foreach (var record in records) {
+            if (!classes.ContainsKey(record.Category!)) {
+                classes[record.Category!] = 0;
             }
+            classes[record.Category!] += 1;
+        }
 
-            var path = "../../../data.csv";
+        var weights = new Dictionary<string, float>();
+        foreach (var (category, count) in classes) {
+            var nSamples = (float) records.Count;
+            var nClasses = (float) classes.Count;
+            var w = nSamples / (nClasses * count);
 
-            if (args.Length > 1) {
-                path = args[1];
+            // Heavily boost NORMAL
+            if (category == "NORMAL") {
+                w *= 8.0f;
             }
+            weights[category] = w;
+        }
 
-            var parentDir = Directory.GetParent(path);
-            if (parentDir == null) {
-                throw new ArgumentException("data.csv did not have a parent directory");
-            }
+        // =========================
+        // STAGE 1: BINARY
+        // =========================
+        var binaryRecords = records.Select(r => new DataBinary {
+            Channel = (ushort)r.Channel,
+            Message = r.Message,
+            IsNormal = (r.Category == "NORMAL")
+        }).ToList();
 
-            var ctx = new MLContext(1);
+        var dfBinary = ctx.Data.LoadFromEnumerable(binaryRecords);
+        var splitBinary = ctx.Data.TrainTestSplit(dfBinary, 0.2, seed: 1);
 
-            List<Data> records;
-
-            using (var fileStream = new FileStream(path, FileMode.Open)) {
-                using var stream = new StreamReader(fileStream);
-                using var csv = new CsvReader(stream, new CsvConfiguration(CultureInfo.InvariantCulture) {
-                    HeaderValidated = null,
-                });
-                records = csv
-                    .GetRecords<Data>()
-                    .Select(rec => {
-                        rec.Message = rec.Message
-                            .Replace("", "") // auto-translate start
-                            .Replace("", "") // auto-translate end
-                            .Replace("\r\n", " ")
-                            .Replace("\r", " ")
-                            .Replace("\n", " ");
-                        return rec;
-                    })
-                    .OrderBy(rec => rec.Category)
-                    .ThenBy(rec => rec.Channel)
-                    .ThenBy(rec => rec.Message)
-                    .ToList();
-            }
-
-            using (var fileStream = new FileStream(path, FileMode.Create)) {
-                using var stream = new StreamWriter(fileStream);
-                using var csv = new CsvWriter(stream, new CsvConfiguration(CultureInfo.InvariantCulture) {
-                    NewLine = "\n",
-                });
-                csv.WriteRecords(records);
-            }
-
-            var classes = new Dictionary<string, uint>();
-
-            foreach (var record in records) {
-                // keep track of how many message of each category we have
-                if (!classes.ContainsKey(record.Category!)) {
-                    classes[record.Category] = 0;
-                }
-
-                classes[record.Category] += 1;
-            }
-
-            // calculate class weights
-            var weights = new Dictionary<string, float>();
-            foreach (var (category, count) in classes) {
-                var nSamples = (float) records.Count;
-                var nClasses = (float) classes.Count;
-                var nSamplesJ = (float) count;
-
-                var w = nSamples / (nClasses * nSamplesJ);
-
-                weights[category] = w;
-            }
-
-            var df = ctx.Data.LoadFromEnumerable(records);
-
-            var ttd = ctx.Data.TrainTestSplit(df, 0.2, seed: 1);
-
-            var compute = new Data.ComputeContext(weights);
-            var normalise = new Data.Normalise();
-
-            ctx.ComponentCatalog.RegisterAssembly(typeof(Data).Assembly);
-
-            var pipeline = ctx.Transforms.Conversion.MapValueToKey("Label", nameof(Data.Category))
-                .Append(ctx.Transforms.CustomMapping(compute.GetMapping(), "Compute"))
-                .Append(ctx.Transforms.CustomMapping(normalise.GetMapping(), "Normalise"))
-                .Append(ctx.Transforms.Text.NormalizeText("MsgNormal", nameof(Data.Normalise.Normalised.NormalisedMessage), keepPunctuations: false, keepNumbers: false))
+        var pipelineBinary =
+            ctx.Transforms.Text.NormalizeText("MsgNormal", nameof(DataBinary.Message), 
+                    keepPunctuations: false, keepNumbers: false)
                 .Append(ctx.Transforms.Text.TokenizeIntoWords("MsgTokens", "MsgNormal"))
                 .Append(ctx.Transforms.Text.RemoveDefaultStopWords("MsgNoDefStop", "MsgTokens"))
                 .Append(ctx.Transforms.Text.RemoveStopWords("MsgNoStop", "MsgNoDefStop", StopWords))
                 .Append(ctx.Transforms.Conversion.MapValueToKey("MsgKey", "MsgNoStop"))
-                .Append(ctx.Transforms.Text.ProduceNgrams("MsgNgrams", "MsgKey", weighting: NgramExtractingEstimator.WeightingCriteria.Tf))
-                .Append(ctx.Transforms.NormalizeLpNorm("FeaturisedMessage", "MsgNgrams"))
-                .Append(ctx.Transforms.Conversion.ConvertType("CPartyFinder", nameof(Data.Computed.PartyFinder)))
-                .Append(ctx.Transforms.Conversion.ConvertType("CShout", nameof(Data.Computed.Shout)))
-                .Append(ctx.Transforms.Conversion.ConvertType("CTrade", nameof(Data.Computed.ContainsTradeWords)))
-                .Append(ctx.Transforms.Conversion.ConvertType("CSketch", nameof(Data.Computed.ContainsSketchUrl)))
-                .Append(ctx.Transforms.Conversion.ConvertType("HasWard", nameof(Data.Computed.ContainsWard)))
-                .Append(ctx.Transforms.Conversion.ConvertType("HasPlot", nameof(Data.Computed.ContainsPlot)))
-                .Append(ctx.Transforms.Conversion.ConvertType("HasNumbers", nameof(Data.Computed.ContainsHousingNumbers)))
-                .Append(ctx.Transforms.Concatenate("Features", "FeaturisedMessage", "CPartyFinder", "CShout", "CTrade", "HasWard", "HasPlot", "HasNumbers", "CSketch"))
-                // macro 81.8 micro 84.6 (Tf weighting) - slow
-                // .Append(ctx.MulticlassClassification.Trainers.SdcaMaximumEntropy(exampleWeightColumnName: "Weight", l1Regularization: 0, l2Regularization: 0, maximumNumberOfIterations: 2_500))
-                .Append(ctx.MulticlassClassification.Trainers.SdcaMaximumEntropy(exampleWeightColumnName: "Weight", l1Regularization: 0, l2Regularization: 0, maximumNumberOfIterations: null))
-                .Append(ctx.Transforms.Conversion.MapKeyToValue("PredictedLabel"));
+                .Append(ctx.Transforms.Text.ProduceNgrams("MsgNgrams", "MsgKey",
+                    weighting: NgramExtractingEstimator.WeightingCriteria.Tf))
+                .Append(ctx.Transforms.NormalizeLpNorm("Features", "MsgNgrams"))
+                .Append(ctx.BinaryClassification.Trainers.SdcaLogisticRegression(
+                    labelColumnName: nameof(DataBinary.IsNormal),
+                    featureColumnName: "Features"));
 
-            var train = mode switch {
-                Mode.Test => ttd.TrainSet,
-                Mode.CreateModel => df,
-                Mode.Interactive => ttd.TrainSet,
-                Mode.InteractiveFull => df,
-                _ => throw new ArgumentOutOfRangeException($"mode {mode} not handled"),
-            };
+        var trainBinary = (mode == Mode.CreateModel) ? dfBinary : splitBinary.TrainSet;
+        var modelBinary = pipelineBinary.Fit(trainBinary);
 
-            var model = pipeline.Fit(train);
+        // Evaluate Stage 1 in test mode
+        if (mode == Mode.Test) {
+            var predsBinary = modelBinary.Transform(splitBinary.TestSet);
+            var evalBinary = ctx.BinaryClassification.Evaluate(
+                predsBinary, labelColumnName: nameof(DataBinary.IsNormal));
 
-            if (mode == Mode.CreateModel) {
-                var savePath = Path.Join(parentDir.FullName, "model.zip");
-                ctx.Model.Save(model, train.Schema, savePath);
-            }
+            Console.WriteLine("=== STAGE 1: Normal vs. Not Normal ===");
+            Console.WriteLine($" Accuracy: {evalBinary.Accuracy:P3}");
+            Console.WriteLine($" AUC: {evalBinary.AreaUnderRocCurve:P3}");
+            Console.WriteLine($" F1Score: {evalBinary.F1Score:P3}");
+            Console.WriteLine();
+            
+            // =============== ADDED LOGGING FOR MISCLASSIFICATIONS ===============
+            int falsePositives = 0, falseNegatives = 0, truePositives = 0, trueNegatives = 0;
+            var dataView = ctx.Data.CreateEnumerable<DataBinary>(splitBinary.TestSet, reuseRowObject: false);
+            var predictionEngine = ctx.Model.CreatePredictionEngine<DataBinary, PredictionBinary>(modelBinary);
 
-            var testPredictions = model.Transform(ttd.TestSet);
-            var eval = ctx.MulticlassClassification.Evaluate(testPredictions);
+            foreach (var data in dataView) {
+                var prediction = predictionEngine.Predict(data);
 
-            var predEngine = ctx.Model.CreatePredictionEngine<Data, Prediction>(model);
-
-            var slotNames = new VBuffer<ReadOnlyMemory<char>>();
-            predEngine.OutputSchema["Score"].GetSlotNames(ref slotNames);
-            var names = slotNames.DenseValues()
-                .Select(column => column.ToString())
-                .ToList();
-
-            var cols = new string[1 + names.Count];
-            cols[0] = "";
-            for (var j = 0; j < names.Count; j++) {
-                cols[j + 1] = names[j];
-            }
-
-            var table = new ConsoleTable(cols);
-
-            for (var i = 0; i < names.Count; i++) {
-                var name = names[i];
-                var confuse = eval.ConfusionMatrix.Counts[i];
-
-                var row = new object[1 + confuse.Count];
-                row[0] = name;
-                for (var j = 0; j < confuse.Count; j++) {
-                    if (i == j) {
-                        row[j + 1] = $"= {confuse[j]} =";
+                if (data.IsNormal) {
+                    if (prediction.PredictedIsNormal) {
+                        truePositives++; // Correctly identified as NORMAL
                     } else {
-                        row[j + 1] = confuse[j];
+                        falseNegatives++; // NON NORMAL predicted as NORMAL
+                    }
+                } else {
+                    if (prediction.PredictedIsNormal) {
+                        falsePositives++; // NORMAL predicted as NON NORMAL
+                    } else {
+                        trueNegatives++; // Correctly identified as NON NORMAL
                     }
                 }
-
-                table.AddRow(row);
             }
 
-            Console.WriteLine("Rows are expected classification and columns are actual classification.");
+            Console.WriteLine("=== STAGE 1 MISCLASSIFICATIONS ===");
+            Console.WriteLine($" True Positives (NORMAL -> NORMAL): {truePositives}");
+            Console.WriteLine($" True Negatives (NOT NORMAL -> NOT NORMAL): {trueNegatives}");
+            Console.WriteLine($" False Positives (NORMAL -> NOT NORMAL): {falsePositives}");
+            Console.WriteLine($" False Negatives (NOT NORMAL -> NORMAL): {falseNegatives}");
+            Console.WriteLine($" False Positive Rate (FPR): {(float)falsePositives / (falsePositives + trueNegatives):P3}");
+            Console.WriteLine($" False Negative Rate (FNR): {(float)falseNegatives / (falseNegatives + truePositives):P3}");
+            Console.WriteLine();
+            // ===================================================================
+        }
+
+        // =========================
+        // STAGE 2: MULTICLASS FOR NOT-NORMAL
+        // =========================
+        var notNormalRecords = records.Where(r => r.Category != "NORMAL").ToList();
+        var dfMulti = ctx.Data.LoadFromEnumerable(notNormalRecords);
+        var splitMulti = ctx.Data.TrainTestSplit(dfMulti, 0.2, seed: 1);
+
+        // Reuse your existing transforms
+        ctx.ComponentCatalog.RegisterAssembly(typeof(Data).Assembly);
+        var compute = new Data.ComputeContext(weights);
+        var normalise = new Data.Normalise();
+
+        var pipelineMulti = ctx.Transforms.Conversion.MapValueToKey("Label", nameof(Data.Category))
+            .Append(ctx.Transforms.CustomMapping(compute.GetMapping(), "Compute"))
+            .Append(ctx.Transforms.CustomMapping(normalise.GetMapping(), "Normalise"))
+            .Append(ctx.Transforms.Text.NormalizeText("MsgNormal",
+                nameof(Data.Normalise.Normalised.NormalisedMessage),
+                keepPunctuations: false,
+                keepNumbers: false))
+            .Append(ctx.Transforms.Text.TokenizeIntoWords("MsgTokens", "MsgNormal"))
+            .Append(ctx.Transforms.Text.RemoveDefaultStopWords("MsgNoDefStop", "MsgTokens"))
+            .Append(ctx.Transforms.Text.RemoveStopWords("MsgNoStop", "MsgNoDefStop", StopWords))
+            .Append(ctx.Transforms.Conversion.MapValueToKey("MsgKey", "MsgNoStop"))
+            .Append(ctx.Transforms.Text.ProduceNgrams("MsgNgrams", "MsgKey",
+                weighting: NgramExtractingEstimator.WeightingCriteria.Tf))
+            .Append(ctx.Transforms.NormalizeLpNorm("FeaturisedMessage", "MsgNgrams"))
+            .Append(ctx.Transforms.Conversion.ConvertType("CPartyFinder", nameof(Data.Computed.PartyFinder)))
+            .Append(ctx.Transforms.Conversion.ConvertType("CShout", nameof(Data.Computed.Shout)))
+            .Append(ctx.Transforms.Conversion.ConvertType("CTrade", nameof(Data.Computed.ContainsTradeWords)))
+            .Append(ctx.Transforms.Conversion.ConvertType("CSketch", nameof(Data.Computed.ContainsSketchUrl)))
+            .Append(ctx.Transforms.Conversion.ConvertType("HasWard", nameof(Data.Computed.ContainsWard)))
+            .Append(ctx.Transforms.Conversion.ConvertType("HasPlot", nameof(Data.Computed.ContainsPlot)))
+            .Append(ctx.Transforms.Conversion.ConvertType("HasNumbers", nameof(Data.Computed.ContainsHousingNumbers)))
+            .Append(ctx.Transforms.Concatenate("Features", 
+                "FeaturisedMessage", "CPartyFinder", "CShout", "CTrade",
+                "HasWard", "HasPlot", "HasNumbers", "CSketch"))
+            .Append(ctx.MulticlassClassification.Trainers.SdcaMaximumEntropy(
+                labelColumnName: "Label",
+                featureColumnName: "Features",
+                exampleWeightColumnName: "Weight"
+            ))
+            .Append(ctx.Transforms.Conversion.MapKeyToValue("PredictedLabel"));
+
+        var trainMulti = (mode == Mode.CreateModel) ? dfMulti : splitMulti.TrainSet;
+        var modelMulti = pipelineMulti.Fit(trainMulti);
+
+        // Save both sub-models into one .zip
+        if (mode == Mode.CreateModel) {
+            var singleZipPath = Path.Join(parentDir.FullName, "model.zip");
+
+            using (var file = File.Create(singleZipPath))
+            using (var archive =
+                   new System.IO.Compression.ZipArchive(file, System.IO.Compression.ZipArchiveMode.Create))
+            {
+                var binaryEntry = archive.CreateEntry("model_binary.zip");
+                using (var stream = binaryEntry.Open()) {
+                    ctx.Model.Save(modelBinary, trainBinary.Schema, stream);
+                }
+
+                var multiEntry = archive.CreateEntry("model_multiclass.zip");
+                using (var stream = multiEntry.Open()) {
+                    ctx.Model.Save(modelMulti, trainMulti.Schema, stream);
+                }
+            }
+        }
+
+        // Evaluate Stage 2 in test mode
+        if (mode == Mode.Test) {
+            var predsMulti = modelMulti.Transform(splitMulti.TestSet);
+            var evalMulti = ctx.MulticlassClassification.Evaluate(predsMulti);
+
+            Console.WriteLine("=== STAGE 2: (Not Normal) Multiclass ===");
+            Console.WriteLine($" Macro acc: {evalMulti.MacroAccuracy * 100:F3}");
+            Console.WriteLine($" Micro acc: {evalMulti.MicroAccuracy * 100:F3}");
+            Console.WriteLine($" Log loss : {evalMulti.LogLoss * 100:F3}");
             Console.WriteLine();
 
-            Console.WriteLine(table.ToString());
+            // =============== ADDED TABLE CODE (Detailed Confusion Matrix) ===============
+            // This prints a table with rows=expected, columns=predicted, just for stage-2 classes
+            var slotNames2 = new VBuffer<ReadOnlyMemory<char>>();
+            // We'll create a temporary prediction engine just for slot names, or
+            // we can grab from predsMulti.Schema if needed
+            predsMulti.Schema["Score"].GetSlotNames(ref slotNames2);
+            var names2 = slotNames2.DenseValues().Select(s => s.ToString()).ToList();
 
-            Console.WriteLine($"Log loss : {eval.LogLoss * 100}");
-            Console.WriteLine($"Macro acc: {eval.MacroAccuracy * 100}");
-            Console.WriteLine($"Micro acc: {eval.MicroAccuracy * 100}");
-
-            switch (mode) {
-                case Mode.Test:
-                case Mode.CreateModel:
-                    return;
+            var cols2 = new string[1 + names2.Count];
+            cols2[0] = "";
+            for (var i = 0; i < names2.Count; i++) {
+                cols2[i+1] = names2[i];
             }
 
-            while (true) {
-                var msg = Console.ReadLine()!.Trim();
+            var table2 = new ConsoleTable(cols2);
 
-                var parts = msg.Split(' ', 2);
-
-                if (parts.Length < 2 || !ushort.TryParse(parts[0], out var channel)) {
-                    continue;
+            // The confusion matrix is 2D: evalMulti.ConfusionMatrix.Counts[row][col]
+            for (var i = 0; i < names2.Count; i++) {
+                var name = names2[i];
+                var confuseRow = evalMulti.ConfusionMatrix.Counts[i];
+                var row = new object[1 + confuseRow.Count];
+                row[0] = name;
+                for (int j = 0; j < confuseRow.Count; j++) {
+                    if (i == j) {
+                        row[j+1] = $"= {confuseRow[j]} =";
+                    } else {
+                        row[j+1] = confuseRow[j];
+                    }
                 }
+                table2.AddRow(row);
+            }
 
-                var size = Base64.GetMaxDecodedFromUtf8Length(parts[1].Length);
-                var buf = new byte[size];
-                if (Convert.TryFromBase64String(parts[1], buf, out var written)) {
-                    parts[1] = Encoding.UTF8.GetString(buf[..written]);
-                }
+            Console.WriteLine("Rows = expected class, columns = predicted class");
+            Console.WriteLine(table2.ToString());
+            // =============== END ADDED TABLE CODE ===============
+        }
 
-                var input = new Data(channel, parts[1]);
-                var pred = predEngine.Predict(input);
+        // =========================
+        // If we're only test/create-model, exit
+        // =========================
+        switch (mode) {
+            case Mode.Test:
+            case Mode.CreateModel:
+                return;
+        }
 
-                Console.WriteLine(pred.Category);
-                for (var i = 0; i < names.Count; i++) {
-                    Console.WriteLine($"    {names[i]}: {pred.Probabilities[i] * 100}");
+        // =========================
+        // INTERACTIVE
+        // =========================
+
+        var predEngineBinary = ctx.Model.CreatePredictionEngine<DataBinary, PredictionBinary>(modelBinary);
+        var predEngineMulti  = ctx.Model.CreatePredictionEngine<Data, Prediction>(modelMulti);
+
+        // We can read the class names for debug if desired
+        var slotNames = new VBuffer<ReadOnlyMemory<char>>();
+        predEngineMulti.OutputSchema["Score"].GetSlotNames(ref slotNames);
+        var multiClassNames = slotNames.DenseValues().Select(x => x.ToString()).ToList();
+
+        Console.WriteLine("Interactive mode: Enter `<channel> <Base64Message>`.  Empty line to exit.");
+
+        while (true) {
+            var line = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(line)) break;
+
+            var parts = line.Split(' ', 2);
+            if (parts.Length < 2 || !ushort.TryParse(parts[0], out var channel)) {
+                continue;
+            }
+
+            var base64Msg = parts[1];
+            var size = Base64.GetMaxDecodedFromUtf8Length(base64Msg.Length);
+            var buf = new byte[size];
+            if (Convert.TryFromBase64String(base64Msg, buf, out var written)) {
+                base64Msg = Encoding.UTF8.GetString(buf.AsSpan(0, written));
+            }
+
+            // Stage 1
+            var binInput = new DataBinary {
+                Channel = channel,
+                Message = base64Msg
+            };
+            var binPred = predEngineBinary.Predict(binInput);
+
+            // =============== ADDED THRESHOLD OVERRIDE ===============
+            // "If in doubt, classify as NORMAL."
+            // We can override the default (true/false) by checking Probability(IsNormal).
+            // e.g. if Probability >= 0.4 => normal
+            // Tweak the threshold to tilt borderline spam → normal.
+
+            float threshold = 0.3f;
+            bool predictedIsNormal;
+            if (binPred.Probability >= threshold) {
+                predictedIsNormal = true;
+            } else {
+                predictedIsNormal = false;
+            }
+            // =========================================================
+
+            if (predictedIsNormal) {
+                // "Borderline spam" or "Definite normal" => Normal
+                Console.WriteLine("NORMAL");
+            }
+            else {
+                // If not normal, Stage 2
+                var dataInput = new Data(channel, base64Msg);
+                var multiPred = predEngineMulti.Predict(dataInput);
+
+                Console.WriteLine(multiPred.Category);
+
+                // optional: see the probabilities
+                for (int i = 0; i < multiClassNames.Count; i++) {
+                    Console.WriteLine($"  {multiClassNames[i]}: {multiPred.Probabilities[i] * 100:F2}%");
                 }
             }
         }
