@@ -57,6 +57,11 @@ namespace NoSoliciting.Trainer {
         }
 
         private static void Main(string[] args) {
+            if (args.Length==0)
+            {
+                Console.WriteLine("Please provide a valid launch argument");
+                return;
+            }
             var mode = args[0] switch {
                 "test" => Mode.Test,
                 "create-model" => Mode.CreateModel,
