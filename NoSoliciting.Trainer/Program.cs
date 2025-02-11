@@ -243,13 +243,40 @@ namespace NoSoliciting.Trainer {
             Console.WriteLine($"Log loss : {eval.LogLoss * 100}");
             Console.WriteLine($"Macro acc: {eval.MacroAccuracy * 100}");
             Console.WriteLine($"Micro acc: {eval.MicroAccuracy * 100}");
+            
+            FileStream ostrm;
+            StreamWriter writer;
+            TextWriter oldOut = Console.Out;
+            try
+            {
+                ostrm = new FileStream ("./out"+DateTime.Now.ToString("dd-M--HH-mm-ss")+".txt", FileMode.OpenOrCreate, FileAccess.Write);
+                writer = new StreamWriter (ostrm);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine ("Cannot open file for writing");
+                Console.WriteLine (e.Message);
+                return;
+            }
+            Console.SetOut (writer);
+            Console.WriteLine("Rows are expected classification and columns are actual classification.");
+            Console.WriteLine();
 
+            Console.WriteLine(table.ToString());
+
+            Console.WriteLine($"Log loss : {eval.LogLoss * 100}");
+            Console.WriteLine($"Macro acc: {eval.MacroAccuracy * 100}");
+            Console.WriteLine($"Micro acc: {eval.MicroAccuracy * 100}");
+            Console.SetOut(oldOut);
+            writer.Close();
+            ostrm.Close();
+            Console.WriteLine ("Log saved");
             switch (mode) {
                 case Mode.Test:
                 case Mode.CreateModel:
                     return;
             }
-
+            
             while (true) {
                 var msg = Console.ReadLine()!.Trim();
 
